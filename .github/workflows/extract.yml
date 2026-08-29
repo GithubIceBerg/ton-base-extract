@@ -1,0 +1,58 @@
+name: ton-extract
+on:
+  workflow_dispatch: {}
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: prep disk + duckdb
+        run: |
+          set -e
+          sudo mkdir -p /mnt/w/parts /mnt/w/tmp && sudo chmod -R 777 /mnt/w
+          cd /mnt/w
+          curl -sL https://github.com/duckdb/duckdb/releases/download/v1.1.3/duckdb_cli-linux-amd64.zip -o d.zip
+          unzip -q d.zip && chmod +x duckdb && ./duckdb --version
+      - name: extract 25 missing months (2024-08..2026-08)
+        run: |
+          cd /mnt/w
+          DB=./duckdb
+          months=""
+          for y in 2024 2025 2026; do for m in 01 02 03 04 05 06 07 08 09 10 11 12; do
+            [ "$y" = 2024 ] && [ "$m" \< 08 ] && continue
+            [ "$y" = 2026 ] && [ "$m" \> 08 ] && continue
+            months="$months $y-$m"
+          done; done
+          echo "months:$months"
+          for ym in $months; do
+            OUT=parts/$ym.txt
+            ok=0
+            for try in 1 2 3 4 5; do
+              "$DB" -c "
+                LOAD httpfs; SET s3_region='us-east-1'; SET threads=4;
+                SET memory_limit='12GB'; SET temp_directory='/mnt/w/tmp'; SET preserve_insertion_order=false;
+                CREATE SECRET s (TYPE S3, PROVIDER config, KEY_ID '', SECRET '', REGION 'us-east-1');
+                COPY (SELECT DISTINCT substr(address,3) AS h
+                      FROM read_parquet('s3://aws-public-blockchain/v1.1/ton/balances_history/date=${ym}-*/*')
+                      WHERE starts_with(address,'0:'))
+                TO '${OUT}.tmp' (HEADER false, QUOTE '');" \
+                && { mv "${OUT}.tmp" "$OUT"; ok=1; break; }
+              echo "  $ym try$try failed, retry..."; sleep 8
+            done
+            [ "$ok" = 1 ] && echo "$ym DONE $(wc -l <"$OUT")" || { echo "$ym FAILED"; exit 1; }
+          done
+      - name: merge distinct + gzip
+        run: |
+          cd /mnt/w
+          ./duckdb -c "
+            SET memory_limit='12GB'; SET temp_directory='/mnt/w/tmp';
+            COPY (SELECT DISTINCT h FROM read_csv('/mnt/w/parts/*.txt', columns={'h':'VARCHAR'}, header=false))
+            TO '/mnt/w/ton_wc0_25mo.txt' (HEADER false, QUOTE '');"
+          wc -l /mnt/w/ton_wc0_25mo.txt
+          gzip -1 -c /mnt/w/ton_wc0_25mo.txt > /mnt/w/ton_wc0_25mo.txt.gz
+          ls -la /mnt/w/ton_wc0_25mo.txt.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ton_wc0_25mo
+          path: /mnt/w/ton_wc0_25mo.txt.gz
+          retention-days: 7
