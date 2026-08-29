@@ -1,46 +1,118 @@
 name: ton-extract
 on:
   workflow_dispatch: {}
+concurrency:
+  group: ton-extract
+  cancel-in-progress: false
 jobs:
   extract:
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        ym:
+          - 2024-08
+          - 2024-09
+          - 2024-10
+          - 2024-11
+          - 2024-12
+          - 2025-01
+          - 2025-02
+          - 2025-03
+          - 2025-04
+          - 2025-05
+          - 2025-06
+          - 2025-07
+          - 2025-08
+          - 2025-09
+          - 2025-10
+          - 2025-11
+          - 2025-12
+          - 2026-01
+          - 2026-02
+          - 2026-03
+          - 2026-04
+          - 2026-05
+          - 2026-06
+          - 2026-07
+          - 2026-08
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 60
     steps:
-      - name: prep disk + duckdb
+      - name: prep duckdb
+        run: |
+          set -e
+          sudo mkdir -p /mnt/w/tmp && sudo chmod -R 777 /mnt/w
+          cd /mnt/w
+          curl -sL https://github.com/duckdb/duckdb/releases/download/v1.1.3/duckdb_cli-linux-amd64.zip -o d.zip
+          unzip -q d.zip && chmod +x duckdb && ./duckdb --version
+      - name: extract month ${{ matrix.ym }}
+        run: |
+          cd /mnt/w
+          DB=./duckdb
+          ym='${{ matrix.ym }}'
+          OUT="part_${ym}.txt"
+          ok=0
+          for try in 1 2 3 4 5 6; do
+            "$DB" -c "
+              INSTALL httpfs; LOAD httpfs;
+              SET s3_region='us-east-1'; SET threads=4;
+              SET memory_limit='12GB'; SET temp_directory='/mnt/w/tmp';
+              SET preserve_insertion_order=false;
+              SET http_retries=8; SET http_retry_wait_ms=500; SET http_timeout=120000;
+              CREATE SECRET s (TYPE S3, PROVIDER config, KEY_ID '', SECRET '', REGION 'us-east-1');
+              COPY (SELECT DISTINCT substr(address,3) AS h
+                    FROM read_parquet('s3://aws-public-blockchain/v1.1/ton/balances_history/date=${ym}-*/*')
+                    WHERE starts_with(address,'0:'))
+              TO '${OUT}.tmp' (HEADER false, QUOTE '');" \
+              && { mv "${OUT}.tmp" "$OUT"; ok=1; break; }
+            echo "  $ym try$try failed, retry..."; sleep 10
+          done
+          [ "$ok" = 1 ] || { echo "$ym FAILED after retries"; exit 1; }
+          n=$(wc -l < "$OUT")
+          echo "$ym DONE rows=$n"
+          [ "$n" -gt 0 ] || { echo "$ym EMPTY - abort"; exit 1; }
+          gzip -1 -c "$OUT" > "${OUT}.gz"
+          ls -la "${OUT}.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: part-${{ matrix.ym }}
+          path: /mnt/w/part_${{ matrix.ym }}.txt.gz
+          retention-days: 7
+          if-no-files-found: error
+
+  merge:
+    needs: extract
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: prep duckdb
         run: |
           set -e
           sudo mkdir -p /mnt/w/parts /mnt/w/tmp && sudo chmod -R 777 /mnt/w
           cd /mnt/w
           curl -sL https://github.com/duckdb/duckdb/releases/download/v1.1.3/duckdb_cli-linux-amd64.zip -o d.zip
-          unzip -q d.zip && chmod +x duckdb && ./duckdb --version
-      - name: extract 25 missing months (2024-08..2026-08)
+          unzip -q d.zip && chmod +x duckdb
+      - name: download all part artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: part-*
+          path: /mnt/w/dl
+          merge-multiple: true
+      - name: gunzip parts + verify count
         run: |
           cd /mnt/w
-          DB=./duckdb
-          months=""
-          for y in 2024 2025 2026; do for m in 01 02 03 04 05 06 07 08 09 10 11 12; do
-            [ "$y" = 2024 ] && [ "$m" \< 08 ] && continue
-            [ "$y" = 2026 ] && [ "$m" \> 08 ] && continue
-            months="$months $y-$m"
-          done; done
-          echo "months:$months"
-          for ym in $months; do
-            OUT=parts/$ym.txt
-            ok=0
-            for try in 1 2 3 4 5; do
-              "$DB" -c "
-                INSTALL httpfs; LOAD httpfs; SET s3_region='us-east-1'; SET threads=4;
-                SET memory_limit='12GB'; SET temp_directory='/mnt/w/tmp'; SET preserve_insertion_order=false;
-                CREATE SECRET s (TYPE S3, PROVIDER config, KEY_ID '', SECRET '', REGION 'us-east-1');
-                COPY (SELECT DISTINCT substr(address,3) AS h
-                      FROM read_parquet('s3://aws-public-blockchain/v1.1/ton/balances_history/date=${ym}-*/*')
-                      WHERE starts_with(address,'0:'))
-                TO '${OUT}.tmp' (HEADER false, QUOTE '');" \
-                && { mv "${OUT}.tmp" "$OUT"; ok=1; break; }
-              echo "  $ym try$try failed, retry..."; sleep 8
-            done
-            [ "$ok" = 1 ] && echo "$ym DONE $(wc -l <"$OUT")" || { echo "$ym FAILED"; exit 1; }
+          n=0
+          for f in dl/part_*.txt.gz; do
+            [ -e "$f" ] || continue
+            b=$(basename "$f" .gz)
+            gunzip -c "$f" > "parts/$b"
+            n=$((n+1))
           done
+          echo "part files present: $n / 25"
+          ls -la parts/ | head -40
+          [ "$n" -eq 25 ] || { echo "MISSING PARTS ($n/25) - merge aborts, re-run failed months"; exit 1; }
       - name: merge distinct + gzip
         run: |
           cd /mnt/w
@@ -56,3 +128,4 @@ jobs:
           name: ton_wc0_25mo
           path: /mnt/w/ton_wc0_25mo.txt.gz
           retention-days: 7
+          if-no-files-found: error
