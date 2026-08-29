@@ -29,7 +29,7 @@ jobs:
             ok=0
             for try in 1 2 3 4 5; do
               "$DB" -c "
-                LOAD httpfs; SET s3_region='us-east-1'; SET threads=4;
+                INSTALL httpfs; LOAD httpfs; SET s3_region='us-east-1'; SET threads=4;
                 SET memory_limit='12GB'; SET temp_directory='/mnt/w/tmp'; SET preserve_insertion_order=false;
                 CREATE SECRET s (TYPE S3, PROVIDER config, KEY_ID '', SECRET '', REGION 'us-east-1');
                 COPY (SELECT DISTINCT substr(address,3) AS h
